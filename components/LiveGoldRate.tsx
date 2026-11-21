@@ -26,25 +26,22 @@ export default function LiveGoldRate() {
     async function fetchRates() {
       try {
         // Try to use env variable, fallback to the deployed production URL
-        const workerUrl = process.env.NEXT_PUBLIC_GOLD_RATE_API || "https://mggoldmart-gold-rate.olivegoldsnj.workers.dev/";
-        
-        if (!workerUrl) {
-          // If no URL is provided, display safe baseline rates
-          setRates({
-            "24k": 7400,
-            "22k": 6780,
-            "18k": 5550,
-          });
-          setLoading(false);
+        const workerUrl = process.env.NEXT_PUBLIC_GOLD_RATE_API || "https://mggoldmart-gold-rate.mggoldmart-gold-rate.workers.dev/";
+        const res = await fetch(workerUrl, { cache: "no-store" });
+        if (!res.ok) {
+          console.error("Gold rate API returned an error:", res.status);
           return;
         }
 
-        const res = await fetch(workerUrl, { cache: "no-store" });
-        if (res.ok) {
-          const data = (await res.json()) as GoldRateResponse;
-          if (data.success && data.rates) {
-            setRates(data.rates);
-          }
+        const data = (await res.json()) as GoldRateResponse;
+        if (
+          data.success &&
+          data.rates &&
+          Object.values(data.rates).every((rate) => Number.isFinite(rate) && rate > 0)
+        ) {
+          setRates(data.rates);
+        } else {
+          console.error("Gold rate API returned no valid association rates");
         }
       } catch (err) {
         console.error("Failed to fetch gold rates:", err);

@@ -17,24 +17,35 @@ export default function GoldCalculator() {
   useEffect(() => {
     async function fetchRates() {
       try {
-        const workerUrl = process.env.NEXT_PUBLIC_GOLD_RATE_API || "https://mggoldmart-gold-rate.olivegoldsnj.workers.dev/";
+        const workerUrl = process.env.NEXT_PUBLIC_GOLD_RATE_API || "https://mggoldmart-gold-rate.mggoldmart-gold-rate.workers.dev/";
         const res = await fetch(workerUrl, { cache: "no-store" });
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && data.rates) {
-            setRates(data.rates);
-            return;
-          }
+        if (!res.ok) {
+          console.error("Gold rate API returned an error for calculator:", res.status);
+          return;
+        }
+
+        const data = (await res.json()) as { success: boolean; rates?: GoldRates };
+        if (
+          data.success &&
+          data.rates &&
+          Object.values(data.rates).every((rate) => Number.isFinite(rate) && rate > 0)
+        ) {
+          setRates(data.rates);
+        } else {
+          console.error("Gold rate API returned no valid association rates for calculator");
         }
       } catch (err) {
         console.error("Failed to fetch rates for calculator", err);
       }
-      setRates({ "24k": 7400, "22k": 6780, "18k": 5550 }); // Fallback
     }
     fetchRates();
   }, []);
 
-  const currentRate = rates ? rates[purity] : 0;
+  if (!rates) {
+    return null;
+  }
+
+  const currentRate = rates[purity];
   const estimatedValue = currentRate * (parseFloat(weight) || 0);
 
   return (
@@ -101,11 +112,9 @@ export default function GoldCalculator() {
                     {estimatedValue.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
                   </span>
                 </div>
-                {rates && (
-                  <p className="text-xs text-[#77776f] mt-2 font-medium">
-                    Based on live rate: ₹{currentRate.toLocaleString('en-IN')}/g
-                  </p>
-                )}
+                <p className="text-xs text-[#77776f] mt-2 font-medium">
+                  Based on live rate: ₹{currentRate.toLocaleString('en-IN')}/g
+                </p>
               </div>
             </div>
           </div>

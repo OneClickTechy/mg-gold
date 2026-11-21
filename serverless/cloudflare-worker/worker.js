@@ -2,10 +2,9 @@
  * MG Gold Mart - Gold Rate API Worker
  * 
  * Features:
- * 1. Primary: GoldAPI.io JSON API
- * 2. Fallback: Yahoo Finance JSON API (Zero Key)
- * 3. Fallback: Offline baseline
- * 4. Cloudflare Edge Caching (4 hours)
+ * 1. Primary: Coimbatore Jewellers Association published rates
+ * 2. Alternate: The Jewellers and Diamond Traders Association published rates
+ * 3. Cloudflare Edge Caching (5 minutes)
  */
 
 const CORS_HEADERS = {
@@ -15,84 +14,106 @@ const CORS_HEADERS = {
   'Content-Type': 'application/json; charset=utf-8'
 };
 
-// Calibrated 2026 Coimbatore Benchmark Baseline (Safe offline fallback)
-const FALLBACK_BASELINE = {
-  '24k': 7400,
-  '22k': 6780,
-  '18k': 5550
-};
+function parseCjaRate(html, purity) {
+  const heading = new RegExp(
+    `<h4[^>]*>\\s*${purity}\\s*kt\\s+Gold\\s+Rate\\s*<\\/h4>[\\s\\S]*?<span[^>]*class=["'][^"']*\\brate-price\\b[^"']*["'][^>]*>\\s*(?:₹|&#8377;|&\\#8377;)?\\s*([\\d,]+(?:\\.\\d+)?)\\s*<\\/span>`,
+    'i'
+  );
+  const match = html.match(heading);
+  if (!match) return null;
 
-async function fetchFromGoldApi(apiKey) {
-  if (!apiKey) return null;
-  try {
-    const res = await fetch('https://www.goldapi.io/api/XAU/INR', {
-      headers: {
-        'x-access-token': apiKey,
-        'Content-Type': 'application/json'
-      }
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (data && data.price_gram_24k) {
-        const rate24k = Math.round(data.price_gram_24k);
-        const rate22k = Math.round(data.price_gram_22k || rate24k * (22 / 24));
-        const rate18k = Math.round(data.price_gram_18k || rate24k * (18 / 24));
-        return {
-          source: 'GoldAPI.io (Institutional Precious Metals JSON API)',
-          apiType: 'Dedicated Gold API',
-          rates: { '24k': rate24k, '22k': rate22k, '18k': rate18k }
-        };
-      }
-    }
-  } catch (err) {
-    console.warn('GoldAPI.io request error:', err.message);
-  }
-  return null;
+  const rate = Number(match[1].replace(/,/g, ''));
+  return Number.isFinite(rate) && rate > 0 ? rate : null;
 }
 
-async function fetchFromYahooFinanceJson() {
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'application/json'
-  };
-
+async function fetchFromCja() {
   try {
-    const [goldRes, inrRes] = await Promise.all([
-      fetch('https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=1d', { headers, cf: { cacheTtl: 3600 } }),
-      fetch('https://query1.finance.yahoo.com/v8/finance/chart/USDINR=X?interval=1d&range=1d', { headers, cf: { cacheTtl: 3600 } })
-    ]);
-
-    if (goldRes.ok && inrRes.ok) {
-      const goldData = await goldRes.json();
-      const inrData = await inrRes.json();
-
-      const goldUsdPerOz = goldData?.chart?.result?.[0]?.meta?.regularMarketPrice;
-      const usdInrRate = inrData?.chart?.result?.[0]?.meta?.regularMarketPrice;
-
-      if (goldUsdPerOz && usdInrRate) {
-        // 1 troy ounce = 31.1034768 grams
-        // Landed Indian domestic price includes ~15% duty & local bullion premium
-        const baseInrPerGram = (goldUsdPerOz / 31.1034768) * usdInrRate;
-        const indianDutyAndPremiumMultiplier = 1.15;
-
-        const rate24k = Math.round(baseInrPerGram * indianDutyAndPremiumMultiplier);
-        const rate22k = Math.round(rate24k * (22 / 24));
-        const rate18k = Math.round(rate24k * (18 / 24));
-
-        return {
-          source: 'Yahoo Finance JSON API (COMEX GC=F + USD/INR Index)',
-          apiType: 'Free Financial JSON API (Zero Key)',
-          marketPriceUsdPerOz: goldUsdPerOz,
-          usdInrRate: usdInrRate,
-          rates: { '24k': rate24k, '22k': rate22k, '18k': rate18k }
-        };
-      }
+    const res = await fetch('https://coimbatorejewellery.org/', {
+      headers: { 'User-Agent': 'MGGoldMart Gold Rate/1.0' },
+      cf: { cacheTtl: 300 }
+    });
+    if (!res.ok) {
+      console.warn('CJA rate page request failed:', res.status);
+      return null;
     }
-  } catch (err) {
-    console.warn('Yahoo Finance JSON request error:', err.message);
-  }
 
-  return null;
+    const html = await res.text();
+    const rate22k = parseCjaRate(html, 22);
+    const rate18k = parseCjaRate(html, 18);
+    if (!rate22k || !rate18k) {
+      console.warn('CJA rate page did not contain valid 22K and 18K rates');
+      return null;
+    }
+
+    const updateTime = html.match(
+      /<p[^>]*class=["'][^"']*\bUpdatetime\b[^"']*["'][^>]*>\s*Update Time:\s*([^<]+)</i
+    )?.[1]?.trim();
+
+    return {
+      source: 'Coimbatore Jewellers Association (CJA)',
+      apiType: 'Published CJA rate page',
+      sourceUpdatedAt: updateTime || null,
+      rates: {
+        '24k': Math.round(rate22k * (24 / 22)),
+        '22k': rate22k,
+        '18k': rate18k
+      }
+    };
+  } catch (err) {
+    console.warn('CJA rate page request error:', err.message);
+    return null;
+  }
+}
+
+function parseMjdtaRate(html, purity) {
+  const ratePattern = new RegExp(
+    `\\$\\(['"]#goldrate_${purity}ct['"]\\)\\.html\\(\\s*['"]([\\d,]+(?:\\.\\d+)?)['"]\\s*\\)`,
+    'i'
+  );
+  const match = html.match(ratePattern);
+  if (!match) return null;
+
+  const rate = Number(match[1].replace(/,/g, ''));
+  return Number.isFinite(rate) && rate > 0 ? rate : null;
+}
+
+async function fetchFromMjdta() {
+  try {
+    const res = await fetch('https://thejewellersassociation.org/', {
+      headers: { 'User-Agent': 'MGGoldMart Gold Rate/1.0' },
+      cf: { cacheTtl: 300 }
+    });
+    if (!res.ok) {
+      console.warn('MJDTA rate page request failed:', res.status);
+      return null;
+    }
+
+    const html = await res.text();
+    const rate22k = parseMjdtaRate(html, 22);
+    const rate18k = parseMjdtaRate(html, 18);
+    if (!rate22k || !rate18k) {
+      console.warn('MJDTA rate page did not contain valid 22K and 18K rates');
+      return null;
+    }
+
+    const updateTime = html.match(
+      /#updatetime['"]\)\.html\(\s*['"]([^'"]+)['"]\s*\)/i
+    )?.[1]?.trim();
+
+    return {
+      source: 'The Jewellers and Diamond Traders Association (MJDTA)',
+      apiType: 'Published MJDTA rate page',
+      sourceUpdatedAt: updateTime || null,
+      rates: {
+        '24k': Math.round(rate22k * (24 / 22)),
+        '22k': rate22k,
+        '18k': rate18k
+      }
+    };
+  } catch (err) {
+    console.warn('MJDTA rate page request error:', err.message);
+    return null;
+  }
 }
 
 const worker = {
@@ -103,7 +124,9 @@ const worker = {
 
     const url = new URL(request.url);
     const cache = typeof caches !== 'undefined' ? caches.default : null;
-    const cacheKey = new Request(url.toString(), request);
+    const cacheUrl = new URL(url);
+    cacheUrl.searchParams.set('cacheVersion', 'association-v2');
+    const cacheKey = new Request(cacheUrl.toString(), request);
 
     if (cache) {
       let cachedResponse = await cache.match(cacheKey);
@@ -132,52 +155,29 @@ const worker = {
     const formattedDate = `${day} ${monthNames[monthIndex]} ${year}`;
     const isoDate = `${year}-${String(monthIndex + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 
-    let apiData = null;
-    let resolvedKey = '';
-    
-    try {
-      if (env) {
-        const secretBinding = env.API_KEY || env.GOLD_API_KEY || env.DIRECT_GOLD_API_KEY;
-        if (secretBinding) {
-          if (typeof secretBinding.get === 'function') {
-            resolvedKey = await secretBinding.get();
-          } else if (typeof secretBinding === 'string') {
-            resolvedKey = secretBinding;
-          }
-        }
-      }
-    } catch (err) {
-      console.warn('Secrets Store resolution notice:', err.message);
-    }
-
-    if (resolvedKey && resolvedKey.trim() !== '') {
-      apiData = await fetchFromGoldApi(resolvedKey.trim());
-    }
-
+    const apiData = await fetchFromCja() || await fetchFromMjdta();
     if (!apiData) {
-      apiData = await fetchFromYahooFinanceJson();
-    }
-
-    const isLive = Boolean(apiData && apiData.rates);
-    let finalRates = isLive ? apiData.rates : { ...FALLBACK_BASELINE };
-    let dataSource = isLive ? apiData.source : 'Coimbatore Bullion Baseline';
-
-    if (env && env.MANUAL_22K_RATE) {
-      const manual22k = parseInt(env.MANUAL_22K_RATE, 10);
-      if (!isNaN(manual22k) && manual22k > 0) {
-        finalRates['22k'] = manual22k;
-        finalRates['24k'] = Math.round(manual22k * (24 / 22));
-        finalRates['18k'] = Math.round(finalRates['24k'] * (18 / 24));
-        dataSource = 'MG Gold Mart In-House Counter Override';
-      }
+      const unavailablePayload = {
+        success: false,
+        status: 'UNAVAILABLE',
+        message: 'Gold rates could not be retrieved from either association source.'
+      };
+      return new Response(JSON.stringify(unavailablePayload), {
+        status: 503,
+        headers: {
+          ...CORS_HEADERS,
+          'Cache-Control': 'no-store',
+          'X-Rate-Cache': 'MISS'
+        }
+      });
     }
 
     const payload = {
       success: true,
       status: 'LIVE',
-      isRealLiveFetch: isLive,
-      fetchMethod: 'Pure JSON API',
-      apiType: apiData ? apiData.apiType : 'Offline Fallback',
+      isRealLiveFetch: true,
+      fetchMethod: apiData.apiType,
+      apiType: apiData.apiType,
       market: 'Coimbatore Bullion Index',
       location: 'Coimbatore, Tamil Nadu',
       currency: 'INR',
@@ -185,16 +185,17 @@ const worker = {
       updatedDate: isoDate,
       formattedDate: formattedDate,
       timestamp: istDate.toISOString(),
-      rates: finalRates,
-      source: dataSource,
-      cacheTtlSeconds: 14400
+      sourceUpdatedAt: apiData.sourceUpdatedAt,
+      rates: apiData.rates,
+      source: apiData.source,
+      cacheTtlSeconds: 300
     };
 
     const responseHeaders = {
       ...CORS_HEADERS,
-      'Cache-Control': 'public, max-age=14400, s-maxage=14400',
+      'Cache-Control': 'public, max-age=300, s-maxage=300',
       'X-Rate-Cache': 'MISS',
-      'X-Api-Type': apiData ? apiData.apiType : 'Fallback'
+      'X-Api-Type': apiData.apiType
     };
 
     const response = new Response(JSON.stringify(payload, null, 2), {
